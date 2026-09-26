@@ -1,0 +1,10 @@
+
+# packaged skill archives
+*.zip
+
+# local secrets and machine config
+.env
+
+# editor backups
+*.orig
+__pycache__/

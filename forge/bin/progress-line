@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# progress-line — one line for the statusline: where the forge cycle is right now.
+#
+#   progress-line [<cwd>]        cwd defaults to the current folder
+#
+# Empty output means no stage is running, and the line has nothing to show. How to plug it
+# into the statusline and which limits exist — ../reference/progress.md, the section on this line.
+# The log format is there too.
+
+set -u
+cwd=${1:-$PWD}
+STALE_HOURS=${FORGE_STALE_HOURS:-3}        # stage older than this — the run was left, stay silent
+STEP_STALE_MIN=${FORGE_STEP_STALE_MIN:-45} # lone step: covers a dialogue and waiting for plan approval
+
+# --- .forge folder: reference/config-lookup.md, the marker is config.yml -------
+root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || root=""
+common=$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+[ -n "$common" ] && common=$(dirname "$common")
+
+forge=""
+for base in "$root" "$common"; do
+  [ -n "$base" ] && [ -f "$base/.forge/config.yml" ] && { forge="$base/.forge"; break; }
+done
+if [ -z "$forge" ]; then
+  for base in "$root" "$common"; do
+    [ -n "$base" ] && [ -d "$base/.forge" ] && { forge="$base/.forge"; break; }
+  done
+fi
+[ -n "$forge" ] || exit 0
+
+tasks="$forge/tasks"
+if [ -f "$forge/config.yml" ]; then
+  p=$(sed -n '/^paths:/,/^[^[:space:]#]/p' "$forge/config.yml" 2>/dev/null \
+      | sed -n 's/^[[:space:]]\+tasks:[[:space:]]*//p' | head -1 \
+      | sed 's/[[:space:]]*#.*$//; s/^["'"'"']//; s/["'"'"']$//; s/[[:space:]]*$//')
+  if [ -n "$p" ]; then
+    case "$p" in /*) tasks="$p" ;; *) tasks="$(dirname "$forge")/$p" ;; esac
+  fi
+fi
+
+# --- the newest log, and both halves of one task ------------------------------
+file=$(ls -1t "$tasks"/*/progress.tsv "$forge"/run/*.tsv 2>/dev/null \
+       | grep -v '/index\.tsv$' | head -1)
+[ -n "$file" ] && [ -r "$file" ] || exit 0
+
+case "$file" in
+  */run/_frame.tsv) key="-" ;;
+  */run/*.tsv)      key=$(basename "$file" .tsv) ;;
+  *)                key=$(basename "$(dirname "$file")") ;;
+esac
+[[ $key =~ ^([A-Za-z]+-[0-9]+)- ]] && key="${BASH_REMATCH[1]}"
+
+# While the task folder does not exist, auto writes to run/<KEY>.tsv, and the skill already writes to the folder.
+# Read both halves: otherwise the running stage is not visible right at the start of a run.
+files=("$file")
+if [ "$key" != "-" ]; then
+  files=()
+  for f in "$tasks/$key"/progress.tsv "$tasks/$key"-*/progress.tsv "$forge/run/$key.tsv"; do
+    [ -f "$f" ] && files+=("$f")
+  done
+  [ ${#files[@]} -gt 0 ] || files=("$file")
+fi
+
+# --- where we are now ----------------------------------------------------------
+# The running stage is what we show first. If there is none (the skill was called
+# directly, and only /forge:auto opens stages), show the last step
+# while it is fresh: otherwise a direct call does not show in the line at all.
+# Placeholders are "-", not empty fields: bash treats tab as whitespace and
+# merges several in a row, so an empty field shifts along with all fields to its right.
+IFS=$'\t' read -r task stage stage_ts step step_ts < <(sort -s -t$'\t' -k1,1 "${files[@]}" 2>/dev/null | awk -F'\t' '
+  # A fix round is a running unit just like a stage, and it is usually the one open
+  # when the stage is already closed: without it the line shows a step without its unit.
+  $2 != "" { task = $2 }
+  $3 == "stage" && $5 == "start" { so = 1; stage = $4; sts = $1; step = ""; step_ts = "" }
+  $3 == "stage" && $5 == "end" && $4 == stage { so = 0; step = ""; step_ts = "" }
+  $3 == "round" && $5 == "start" { ro = 1; round = $4; rts = $1; step = ""; step_ts = "" }
+  $3 == "round" && $5 == "end" && $4 == round { ro = 0; step = ""; step_ts = "" }
+  $3 == "run"   && $5 == "end"   { so = 0; ro = 0; step = ""; step_ts = "" }
+  $3 == "step"                   { step = $4; step_ts = $1 }
+  END {
+    unit = ro ? round : (so ? stage : "")
+    uts  = ro ? rts   : sts
+    if (so && ro) unit = stage " · " round
+    print (task ? task : "-") "\t" (unit ? unit : "-") "\t" (uts ? uts : "-") \
+          "\t" (step ? step : "-") "\t" (step_ts ? step_ts : "-") }
+')
+
+for v in task stage stage_ts step step_ts; do
+  [ "${!v}" = "-" ] && eval "$v=''"
+done
+
+now=$(date +%s)
+if [ -n "${stage:-}" ]; then
+  started=$(date -d "$stage_ts" +%s 2>/dev/null) || exit 0
+  limit=$(( STALE_HOURS * 3600 ))
+else
+  [ -n "${step:-}" ] && [ -n "${step_ts:-}" ] || exit 0
+  started=$(date -d "$step_ts" +%s 2>/dev/null) || exit 0
+  limit=$(( STEP_STALE_MIN * 60 ))
+fi
+d=$(( now - started ))
+[ "$d" -gt "$limit" ] && exit 0
+
+if   [ "$d" -lt 60 ];   then el="${d}s"
+elif [ "$d" -lt 3600 ]; then el="$(( d / 60 ))m"
+else el="$(( d / 3600 ))h $(( d % 3600 / 60 ))m"; fi
+
+[ ${#step} -gt 38 ] && step="${step:0:37}…"
+
+parts=()
+[ -n "${task:-}" ] && parts+=("$task")            # skills outside a task have none
+[ -n "${stage:-}" ] && parts+=("$stage")
+[ -n "${step:-}" ] && parts+=("$step")
+parts+=("$el")
+out=$(printf ' · %s' "${parts[@]}"); out=${out# · }
+printf '⚙ %s' "$out"

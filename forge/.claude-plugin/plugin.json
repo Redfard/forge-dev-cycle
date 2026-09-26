@@ -1,0 +1,8 @@
+{
+  "name": "forge",
+  "description": "Feature development cycle from idea to commit: per-task artifacts in .forge/, a required convention frame, findings fed back into the rules. The full cycle runs with /forge:auto, as a team of three roles or solo.",
+  "version": "1.7.0",
+  "author": {
+    "name": "Redfard"
+  }
+}

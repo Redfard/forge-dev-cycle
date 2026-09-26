@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# forge-progress — writes one line of live progress to the task log.
+#
+#   forge-progress <task> start <run|stage|round> "<name>" ["<extra>"]
+#   forge-progress <task> end   <run|stage|round> "<name>" ["<extra>"]
+#   forge-progress <task> step  "<name>" ["<extra>"]
+#   forge-progress <task> note  "<text>"
+#
+# Protocol: ../reference/progress.md. The task always comes first; "-" for skills outside a task.
+# The script never fails the caller: any problem is a line on stderr and exit 0.
+
+set -u
+
+warn() { printf 'forge-progress: %s\n' "$1" >&2; exit 0; }
+
+[ $# -ge 2 ] || warn "too few arguments; see reference/progress.md"
+
+task=$1
+verb=$2
+shift 2
+
+case "$verb" in
+  start|end)
+    [ $# -ge 2 ] || warn "$verb needs <kind> and <name>"
+    kind=$1; name=$2; extra=${3:-}
+    case "$kind" in
+      run|stage|round) ;;
+      *) warn "unknown kind \"$kind\" (run|stage|round)" ;;
+    esac
+    event=$verb
+    ;;
+  step)
+    [ $# -ge 1 ] || warn "step needs <name>"
+    kind=step; name=$1; extra=${2:-}; event=start
+    ;;
+  note)
+    [ $# -ge 1 ] || warn "note needs <text>"
+    kind=note; name=$1; extra=${2:-}; event=start
+    ;;
+  *) warn "unknown command \"$verb\" (start|end|step|note)" ;;
+esac
+
+# --- .forge folder: the same steps as in reference/config-lookup.md -----------
+# The marker is the config.yml file, as written there: an empty .forge folder in a worktree
+# (the monitor's bind-mount creates one, for example) must not pull the log to itself.
+root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+[ -n "$common" ] && common=$(dirname "$common")
+
+forge=""
+for base in "$root" "$common"; do
+  [ -n "$base" ] && [ -f "$base/.forge/config.yml" ] && { forge="$base/.forge"; break; }
+done
+if [ -z "$forge" ]; then   # project without init: the folder exists, the config does not yet
+  for base in "$root" "$common"; do
+    [ -n "$base" ] && [ -d "$base/.forge" ] && { forge="$base/.forge"; break; }
+  done
+fi
+[ -n "$forge" ] || warn ".forge folder not found — line not written"
+home=$(dirname "$forge")
+
+# --- config: on/off switch and paths.tasks -----------------------------------
+cfg="$forge/config.yml"
+cfg_get() {  # cfg_get <section> <key> — value without quotes and trailing comment
+  [ -f "$cfg" ] || return 0
+  sed -n "/^$1:/,/^[^[:space:]#]/p" "$cfg" 2>/dev/null \
+    | sed -n "s/^[[:space:]]\+$2:[[:space:]]*//p" \
+    | head -1 | sed 's/[[:space:]]*#.*$//; s/^["'"'"']//; s/["'"'"']$//; s/[[:space:]]*$//'
+}
+
+case "$(cfg_get defaults progress | tr '[:upper:]' '[:lower:]')" in
+  off|false|no) exit 0 ;;
+esac
+
+tasks=$(cfg_get paths tasks)
+if [ -z "$tasks" ]; then tasks="$forge/tasks"
+elif [ "${tasks#/}" = "$tasks" ]; then tasks="$home/$tasks"; fi
+
+# --- task: key, folder name or path to state.md — all become one value --------
+# auto knows the key, a stage skill knows the folder name {KEY}-{slug}. Without turning
+# them into one value, the stages and steps of one task split across two files.
+if [ "$task" = "-" ] || [ -z "$task" ]; then
+  task="-"
+else
+  case "$task" in */state.md) task=${task%/state.md} ;; esac
+  task=${task%/}; task=${task##*/}                    # path → last segment
+  task=${task//[^A-Za-z0-9_.-]/-}                     # only this gets into the path
+  task=${task#.}; [ -z "$task" ] && task="-"
+fi
+
+dir=""
+if [ "$task" != "-" ]; then
+  if [ -d "$tasks/$task" ]; then dir="$tasks/$task"
+  else dir=$(ls -1dt "$tasks/$task"-*/ 2>/dev/null | head -1); dir=${dir%/}; fi
+  # The task column is the key, if it can be taken from the folder name: otherwise auto writes
+  # "ABC-123", the skill writes "ABC-123-add-login", and the monitor shows two different tasks.
+  [[ $task =~ ^([A-Za-z]+-[0-9]+)- ]] && task="${BASH_REMATCH[1]}"
+fi
+
+if [ "$task" = "-" ]; then
+  file="$forge/run/_frame.tsv"
+elif [ -n "$dir" ] && [ -d "$dir" ]; then
+  file="$dir/progress.tsv"
+else
+  file="$forge/run/$task.tsv"   # the task folder does not exist yet (first steps of /forge:task)
+fi
+
+mkdir -p "$forge/run" 2>/dev/null || warn "cannot create $forge/run"
+
+# --- the log is not an artifact: keep it out of commits ----------------------
+ignore="$forge/.gitignore"
+if [ -s "$ignore" ] && [ -n "$(tail -c 1 "$ignore" 2>/dev/null)" ]; then
+  printf '\n' >> "$ignore" 2>/dev/null || true   # file without \n at the end: otherwise we glue lines together
+fi
+for line in 'tasks/*/progress.tsv' 'run/'; do
+  if [ ! -f "$ignore" ] || ! grep -qxF "$line" "$ignore" 2>/dev/null; then
+    printf '%s\n' "$line" >> "$ignore" 2>/dev/null || true
+  fi
+done
+
+# --- the line -----------------------------------------------------------------
+ts=$(date -Is 2>/dev/null) || warn "no date -Is"
+clean() { printf '%s' "${1//[$'\t\n\r']/ }"; }
+name=$(clean "$name"); extra=$(clean "$extra")
+
+first=0; [ -s "$file" ] || first=1
+
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$task" "$kind" "$name" "$event" "$extra" \
+  >> "$file" 2>/dev/null || warn "cannot write to $file"
+
+# --- milestones also go to the index: without it the page cannot build the task list --
+# The first line of a task always goes there, otherwise a task run by slash commands (without
+# auto, so without run and stage lines) never shows up in the list.
+case "$kind" in run|stage|round) idx=1 ;; *) idx=$first ;; esac
+[ "$task" = "-" ] && idx=0
+if [ "$idx" = "1" ]; then
+  # dir=<folder> — because the folder is named {KEY}-{slug}, and the page
+  # reads it over HTTP and cannot list the directory.
+  iextra=$extra
+  [ -n "$dir" ] && iextra="${extra:+$extra }dir=$(basename "$dir")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$task" "$kind" "$name" "$event" "$iextra" \
+    >> "$forge/run/index.tsv" 2>/dev/null || true
+fi
+
+exit 0

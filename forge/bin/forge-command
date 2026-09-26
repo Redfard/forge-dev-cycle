@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""forge-command — write long-running commands to the progress log.
+
+    forge-command pre    < JSON of the PreToolUse hook   (Bash)
+    forge-command post   < JSON of the PostToolUse hook  (Bash)
+
+Why: the longest parts of a run are not the model's work but test and gate
+runs. They are not visible in the log, and the time sticks to the step that was
+marked last: "the report took 28 minutes", of which 16 were tests.
+
+Threshold: FORGE_CMD_MIN_SECONDS, default 120. Short calls are not written,
+otherwise the log drowns in git status.
+
+The line goes to `<.forge>/run/commands.tsv` — per project, not per task: the hook
+knows only the folder, it has no task key. The page mixes these lines
+into the timeline by time.
+
+The script never fails the caller: any problem is a silent exit 0.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.environ.get("FORGE_MONITOR_HOME") or os.path.expanduser("~/.config/forge-monitor")
+PENDING = os.path.join(HOME, "cmd-pending.tsv")
+MIN_SECONDS = float(os.environ.get("FORGE_CMD_MIN_SECONDS", "120"))
+STALE = 6 * 3600
+KEY_LEN = 200
+NAME_LEN = 220
+
+# Cut the wrapper before writing: a scratchpad path at the start of the line used up the whole limit,
+# and only "php artisan" was left of the command in the log.
+BOILERPLATE = [
+    re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s*;\s*)+"),
+    re.compile(r"^\s*cd\s+\S+\s*&&\s*"),
+    re.compile(r"docker\s+compose\s+exec\s+(?:-\S+\s+\S+\s+|-\S+\s+)*\S+\s+"),
+]
+
+# The runner's numbers are worth more than an outside measure: they are its own report of what it did.
+SUMMARY = [
+    re.compile(r"Tests:\s+.*", re.I),
+    re.compile(r"Duration:\s+[\d.]+s", re.I),
+    re.compile(r"OK \(\d+ tests?.*?\)", re.I),
+    re.compile(r"FAILURES!.*", re.I),
+    re.compile(r"\b(\d+) (?:passed|failed|skipped)\b", re.I),
+]
+
+
+def clean(s, limit):
+    return " ".join(str(s or "").split())[:limit]
+
+
+def forge_dir(cwd):
+    """.forge folder — by the rules of reference/config-lookup.md, the marker is config.yml."""
+    if not cwd:
+        return None
+    bases = []
+    for args in (["--show-toplevel"], ["--path-format=absolute", "--git-common-dir"]):
+        try:
+            out = subprocess.run(["git", "-C", cwd, "rev-parse"] + args,
+                                 capture_output=True, text=True, timeout=5)
+            p = out.stdout.strip()
+            if p:
+                bases.append(os.path.dirname(p) if "git-common-dir" in args[-1] else p)
+        except Exception:
+            pass
+    for b in bases:
+        if os.path.isfile(os.path.join(b, ".forge", "config.yml")):
+            return os.path.join(b, ".forge")
+    for b in bases:
+        if os.path.isdir(os.path.join(b, ".forge")):
+            return os.path.join(b, ".forge")
+    return None
+
+
+def load_pending():
+    rows = []
+    try:
+        with open(PENDING, encoding="utf-8") as f:
+            now = time.time()
+            for line in f:
+                p = line.rstrip("\n").split("\t")
+                if len(p) >= 3 and now - float(p[0]) < STALE:
+                    rows.append(p)
+    except Exception:
+        pass
+    return rows
+
+
+def save_pending(rows):
+    os.makedirs(HOME, exist_ok=True)
+    with open(PENDING, "w", encoding="utf-8") as f:
+        f.write("".join("\t".join(r) + "\n" for r in rows))
+
+
+def key_of(payload):
+    cmd = (payload.get("tool_input") or {}).get("command")
+    if not cmd:
+        return None, None
+    return clean(payload.get("session_id"), 64) + "|" + clean(cmd, KEY_LEN), cmd
+
+
+def summary_of(payload):
+    resp = payload.get("tool_response")
+    if isinstance(resp, dict):
+        resp = resp.get("stdout") or resp.get("output") or json.dumps(resp, ensure_ascii=False)
+    text = str(resp or "")
+    found = []
+    for rx in SUMMARY:
+        m = rx.findall(text)
+        if m:
+            hit = m[-1]
+            hit = hit if isinstance(hit, str) else " ".join(hit)
+            found.append(clean(hit, 60))
+        if len(found) >= 2:
+            break
+    return " · ".join(found)
+
+
+def main():
+    verb = sys.argv[1] if len(sys.argv) > 1 else ""
+    if verb not in ("pre", "post"):
+        print("forge-command: pre | post", file=sys.stderr)
+        return
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        return
+    if (payload.get("tool_name") or "") != "Bash":
+        return
+
+    key, cmd = key_of(payload)
+    if not key:
+        return
+
+    if verb == "pre":
+        rows = [r for r in load_pending() if r[1] != key]
+        rows.append([str(int(time.time())), key, "1"])
+        save_pending(rows)
+        return
+
+    rows = load_pending()
+    start = next((float(r[0]) for r in rows if r[1] == key), None)
+    save_pending([r for r in rows if r[1] != key])
+    if start is None:
+        return
+    elapsed = int(time.time() - start)
+    if elapsed < MIN_SECONDS:
+        return
+
+    forge = forge_dir(payload.get("cwd"))
+    if not forge:
+        return
+    os.makedirs(os.path.join(forge, "run"), exist_ok=True)
+    extra = "elapsed=%ds" % elapsed
+    s = summary_of(payload)
+    if s:
+        extra += " · " + s
+    shown = clean(cmd, 4000)
+    for rx in BOILERPLATE:
+        shown = rx.sub("", shown, count=1)
+    row = [time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(start)),
+           "-", "cmd", clean(shown, NAME_LEN), "done", extra]
+    # Appending one line is atomic, as in forge-progress.
+    with open(os.path.join(forge, "run", "commands.tsv"), "a", encoding="utf-8") as f:
+        f.write("\t".join(row) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:                       # monitoring must never break the session
+        print("forge-command: %s" % e, file=sys.stderr)
+    sys.exit(0)

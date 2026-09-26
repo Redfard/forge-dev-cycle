@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "forge-dev-cycle",
+  "description": "The forge development cycle for Claude Code: a task from branch to commit — design, spec, code, review, live check.",
+  "owner": {
+    "name": "Redfard"
+  },
+  "plugins": [
+    {
+      "name": "forge",
+      "description": "Feature development cycle: /forge:init, frame-new, frame-existing, task, review-frame, brainstorming, make-extended-spec, review-spec, implement-extended-spec, review, fix, manual-test, review-test, commit, distill; full run /forge:auto + agents (fg-implementer, fg-reviewer, fg-tester, fg-test-planner).",
+      "category": "workflow",
+      "source": "./forge"
+    }
+  ]
+}
